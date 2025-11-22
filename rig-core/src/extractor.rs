@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    agent::{Agent, AgentBuilder, AgentBuilderSimple},
+    agent::{Agent, AgentBuilderSimple},
     completion::{Completion, CompletionError, CompletionModel, ToolDefinition},
     message::{AssistantContent, Message, ToolCall, ToolChoice, ToolFunction},
     tool::Tool,
@@ -65,6 +65,8 @@ where
     agent: Agent<M>,
     _t: PhantomData<T>,
     retries: u64,
+    #[allow(dead_code)]
+    schema_override: Option<serde_json::Value>,
 }
 
 impl<M, T> Extractor<M, T>
@@ -203,6 +205,15 @@ where
     pub async fn into_inner(self) -> Agent<M> {
         self.agent
     }
+
+    #[allow(dead_code)]
+    fn parameters_schema(&self) -> serde_json::Value {
+        if let Some(schema) = &self.schema_override {
+            schema.clone()
+        } else {
+            json!(schema_for!(T))
+        }
+    }
 }
 
 /// Builder for the Extractor
@@ -214,6 +225,7 @@ where
     agent_builder: AgentBuilderSimple<M>,
     _t: PhantomData<T>,
     retries: Option<u64>,
+    schema_override: Option<serde_json::Value>,
 }
 
 impl<M, T> ExtractorBuilder<M, T>
@@ -223,7 +235,7 @@ where
 {
     pub fn new(model: M) -> Self {
         Self {
-            agent_builder: AgentBuilder::new(model)
+            agent_builder: AgentBuilderSimple::new(model)
                 .preamble("\
                     You are an AI assistant whose purpose is to extract structured data from the provided text.\n\
                     You will have access to a `submit` function that defines the structure of the data to extract from the provided text.\n\
@@ -234,6 +246,7 @@ where
                 .tool_choice(ToolChoice::Required),
             retries: None,
             _t: PhantomData,
+            schema_override: None,
         }
     }
 
@@ -262,6 +275,12 @@ where
         self
     }
 
+    /// Override the JSON schema used for extraction (dynamic schemas).
+    pub fn with_schema_value(mut self, schema: serde_json::Value) -> Self {
+        self.schema_override = Some(schema);
+        self
+    }
+
     /// Set the maximum number of retries for the extractor.
     pub fn retries(mut self, retries: u64) -> Self {
         self.retries = Some(retries);
@@ -276,10 +295,20 @@ where
 
     /// Build the Extractor
     pub fn build(self) -> Extractor<M, T> {
+        let agent_builder = if let Some(schema) = &self.schema_override {
+            self.agent_builder.tool(SubmitToolWithSchema::<T> {
+                parameters: schema.clone(),
+                _t: PhantomData,
+            })
+        } else {
+            self.agent_builder.tool(SubmitTool::<T> { _t: PhantomData })
+        };
+
         Extractor {
-            agent: self.agent_builder.build(),
+            agent: agent_builder.build(),
             _t: PhantomData,
             retries: self.retries.unwrap_or(0),
+            schema_override: self.schema_override,
         }
     }
 }
@@ -311,6 +340,38 @@ where
             description: "Submit the structured data you extracted from the provided text."
                 .to_string(),
             parameters: json!(schema_for!(T)),
+        }
+    }
+
+    async fn call(&self, data: Self::Args) -> Result<Self::Output, Self::Error> {
+        Ok(data)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct SubmitToolWithSchema<T>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
+{
+    parameters: serde_json::Value,
+    _t: PhantomData<T>,
+}
+
+impl<T> Tool for SubmitToolWithSchema<T>
+where
+    T: JsonSchema + for<'a> Deserialize<'a> + Serialize + WasmCompatSend + WasmCompatSync,
+{
+    const NAME: &'static str = SUBMIT_TOOL_NAME;
+    type Error = SubmitError;
+    type Args = T;
+    type Output = T;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Submit the structured data you extracted from the provided text."
+                .to_string(),
+            parameters: self.parameters.clone(),
         }
     }
 

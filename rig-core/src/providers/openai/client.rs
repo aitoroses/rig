@@ -1,112 +1,357 @@
+#[cfg(feature = "audio")]
+use super::audio_generation::AudioGenerationModel;
+use super::embedding::{
+    EmbeddingModel, TEXT_EMBEDDING_3_LARGE, TEXT_EMBEDDING_3_SMALL, TEXT_EMBEDDING_ADA_002,
+};
+use std::fmt::Debug;
+
+#[cfg(feature = "image")]
+use super::image_generation::ImageGenerationModel;
+use super::transcription::TranscriptionModel;
+
 use crate::{
     client::{
-        self, BearerAuth, Capabilities, Capable, DebugExt, Provider, ProviderBuilder,
-        ProviderClient,
+        CompletionClient, EmbeddingsClient, ProviderClient, TranscriptionClient, VerifyClient,
+        VerifyError,
     },
     extractor::ExtractorBuilder,
     http_client::{self, HttpClientExt},
-    prelude::CompletionClient,
-    wasm_compat::{WasmCompatSend, WasmCompatSync},
+    providers::openai::CompletionModel,
 };
+
+#[cfg(feature = "audio")]
+use crate::client::AudioGenerationClient;
+#[cfg(feature = "image")]
+use crate::client::ImageGenerationClient;
+
+use bytes::Bytes;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
 
 // ================================================================
 // Main OpenAI Client
 // ================================================================
 const OPENAI_API_BASE_URL: &str = "https://api.openai.com/v1";
 
-// ================================================================
-// OpenAI Responses API Extension
-// ================================================================
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenAIResponsesExt;
+pub struct ClientBuilder<'a, T = reqwest::Client> {
+    api_key: &'a str,
+    base_url: &'a str,
+    http_client: T,
+}
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenAIResponsesExtBuilder;
-
-// ================================================================
-// OpenAI Completions API Extension
-// ================================================================
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenAICompletionsExt;
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct OpenAICompletionsExtBuilder;
-
-type OpenAIApiKey = BearerAuth;
-
-// Responses API client (default)
-pub type Client<H = reqwest::Client> = client::Client<OpenAIResponsesExt, H>;
-pub type ClientBuilder<H = reqwest::Client> =
-    client::ClientBuilder<OpenAIResponsesExtBuilder, OpenAIApiKey, H>;
-
-// Completions API client
-pub type CompletionsClient<H = reqwest::Client> = client::Client<OpenAICompletionsExt, H>;
-pub type CompletionsClientBuilder<H = reqwest::Client> =
-    client::ClientBuilder<OpenAICompletionsExtBuilder, OpenAIApiKey, H>;
-
-impl Provider for OpenAIResponsesExt {
-    type Builder = OpenAIResponsesExtBuilder;
-
-    const VERIFY_PATH: &'static str = "/models";
-
-    fn build<H>(
-        _: &crate::client::ClientBuilder<Self::Builder, OpenAIApiKey, H>,
-    ) -> http_client::Result<Self> {
-        Ok(Self)
+impl<'a, T> ClientBuilder<'a, T>
+where
+    T: Default,
+{
+    pub fn new(api_key: &'a str) -> Self {
+        Self {
+            api_key,
+            base_url: OPENAI_API_BASE_URL,
+            http_client: Default::default(),
+        }
     }
 }
 
-impl Provider for OpenAICompletionsExt {
-    type Builder = OpenAICompletionsExtBuilder;
+impl<'a, T> ClientBuilder<'a, T> {
+    pub fn new_with_client(api_key: &'a str, http_client: T) -> Self {
+        ClientBuilder {
+            api_key,
+            base_url: OPENAI_API_BASE_URL,
+            http_client,
+        }
+    }
 
-    const VERIFY_PATH: &'static str = "/models";
+    pub fn base_url(mut self, base_url: &'a str) -> Self {
+        self.base_url = base_url;
+        self
+    }
 
-    fn build<H>(
-        _: &crate::client::ClientBuilder<Self::Builder, OpenAIApiKey, H>,
-    ) -> http_client::Result<Self> {
-        Ok(Self)
+    pub fn with_client<U>(self, http_client: U) -> ClientBuilder<'a, U> {
+        ClientBuilder {
+            api_key: self.api_key,
+            base_url: self.base_url,
+            http_client,
+        }
+    }
+    pub fn build(self) -> Client<T> {
+        Client {
+            base_url: self.base_url.to_string(),
+            api_key: self.api_key.to_string(),
+            http_client: self.http_client,
+        }
     }
 }
 
-impl<H> Capabilities<H> for OpenAIResponsesExt {
-    type Completion = Capable<super::responses_api::ResponsesCompletionModel<H>>;
-    type Embeddings = Capable<super::EmbeddingModel<H>>;
-    type Transcription = Capable<super::TranscriptionModel<H>>;
-    #[cfg(feature = "image")]
-    type ImageGeneration = Capable<super::ImageGenerationModel<H>>;
-    #[cfg(feature = "audio")]
-    type AudioGeneration = Capable<super::AudioGenerationModel<H>>;
+#[derive(Clone)]
+pub struct Client<T = reqwest::Client> {
+    base_url: String,
+    api_key: String,
+    pub(crate) http_client: T,
 }
 
-impl<H> Capabilities<H> for OpenAICompletionsExt {
-    type Completion = Capable<super::completion::CompletionModel<H>>;
-    type Embeddings = Capable<super::EmbeddingModel<H>>;
-    type Transcription = Capable<super::TranscriptionModel<H>>;
-    #[cfg(feature = "image")]
-    type ImageGeneration = Capable<super::ImageGenerationModel<H>>;
-    #[cfg(feature = "audio")]
-    type AudioGeneration = Capable<super::AudioGenerationModel<H>>;
+impl<T> Debug for Client<T>
+where
+    T: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("api_key", &"<REDACTED>")
+            .finish()
+    }
 }
 
-impl DebugExt for OpenAIResponsesExt {}
+impl Client<reqwest::Client> {
+    /// Create a new OpenAI client builder.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::openai::{ClientBuilder, self};
+    ///
+    /// // Initialize the OpenAI client
+    /// let openai_client = Client::builder("your-open-ai-api-key")
+    ///    .build()
+    /// ```
+    pub fn builder(api_key: &str) -> ClientBuilder<'_, reqwest::Client> {
+        ClientBuilder::new(api_key)
+    }
 
-impl DebugExt for OpenAICompletionsExt {}
+    /// Create a new OpenAI client. For more control, use the `builder` method.
+    ///
+    pub fn new(api_key: &str) -> Self {
+        Self::builder(api_key).build()
+    }
 
-impl ProviderBuilder for OpenAIResponsesExtBuilder {
-    type Output = OpenAIResponsesExt;
-    type ApiKey = OpenAIApiKey;
-
-    const BASE_URL: &'static str = OPENAI_API_BASE_URL;
+    pub fn from_env() -> Self {
+        <Self as ProviderClient>::from_env()
+    }
 }
 
-impl ProviderBuilder for OpenAICompletionsExtBuilder {
-    type Output = OpenAICompletionsExt;
-    type ApiKey = OpenAIApiKey;
+impl<T> Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    pub(crate) fn post(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
 
-    const BASE_URL: &'static str = OPENAI_API_BASE_URL;
+        http_client::with_bearer_auth(http_client::Request::post(url), &self.api_key)
+    }
+
+    pub(crate) fn get(&self, path: &str) -> http_client::Result<http_client::Builder> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+
+        http_client::with_bearer_auth(http_client::Request::get(url), &self.api_key)
+    }
+
+    pub(crate) async fn send<U, R>(
+        &self,
+        req: http_client::Request<U>,
+    ) -> http_client::Result<http_client::Response<http_client::LazyBody<R>>>
+    where
+        U: Into<Bytes> + Send,
+        R: From<Bytes> + Send + 'static,
+    {
+        self.http_client.send(req).await
+    }
+
+    /// Create an extractor builder with the given completion model.
+    /// Intended for use exclusively with the Chat Completions API.
+    /// Useful for using extractors with Chat Completion compliant APIs.
+    pub fn extractor_completions_api<U>(
+        &self,
+        model: &str,
+    ) -> ExtractorBuilder<CompletionModel<T>, U>
+    where
+        U: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync,
+        CompletionModel<T>: crate::completion::CompletionModel,
+    {
+        ExtractorBuilder::new(self.completion_model(model).completions_api())
+    }
+
+    /// Create an extractor builder with an explicit JSON schema override (dynamic schemas).
+    pub fn extractor_with_schema<U>(
+        &self,
+        model: &str,
+        schema: serde_json::Value,
+    ) -> ExtractorBuilder<<Self as CompletionClient>::CompletionModel, U>
+    where
+        U: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync,
+        <Self as CompletionClient>::CompletionModel: crate::completion::CompletionModel,
+    {
+        self.extractor::<U>(model).with_schema_value(schema)
+    }
+
+    /// Create a dynamic extractor builder that returns `serde_json::Value` with a provided schema.
+    pub fn dynamic_extractor_with_schema(
+        &self,
+        model: &str,
+        schema: serde_json::Value,
+    ) -> ExtractorBuilder<<Self as CompletionClient>::CompletionModel, serde_json::Value>
+    where
+        <Self as CompletionClient>::CompletionModel: crate::completion::CompletionModel,
+    {
+        self.extractor::<serde_json::Value>(model)
+            .with_schema_value(schema)
+    }
+}
+
+impl<T> ProviderClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    /// Create a new OpenAI client from the `OPENAI_API_KEY` environment variable.
+    /// Panics if the environment variable is not set.
+    fn from_env() -> Self {
+        let base_url: Option<String> = std::env::var("OPENAI_BASE_URL").ok();
+        let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
+
+        match base_url {
+            Some(url) => ClientBuilder::<T>::new(&api_key).base_url(&url).build(),
+            None => ClientBuilder::<T>::new(&api_key).build(),
+        }
+    }
+
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::Simple(api_key) = input else {
+            panic!("Incorrect provider value type")
+        };
+
+        ClientBuilder::<T>::new(&api_key).build()
+    }
+}
+
+impl<T> CompletionClient for Client<T>
+where
+    T: HttpClientExt + std::fmt::Debug + Clone + Default + Send + 'static,
+{
+    type CompletionModel = super::responses_api::ResponsesCompletionModel<T>;
+    /// Create a completion model with the given name.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::openai::{Client, self};
+    ///
+    /// // Initialize the OpenAI client
+    /// let openai = Client::new("your-open-ai-api-key");
+    ///
+    /// let gpt4 = openai.completion_model(openai::GPT_4);
+    /// ```
+    fn completion_model(&self, model: &str) -> Self::CompletionModel {
+        super::responses_api::ResponsesCompletionModel::new(self.clone(), model)
+    }
+}
+
+impl<T> EmbeddingsClient for Client<T>
+where
+    T: HttpClientExt + std::fmt::Debug + Clone + Default + Send + 'static,
+{
+    type EmbeddingModel = EmbeddingModel<T>;
+    fn embedding_model(&self, model: &str) -> Self::EmbeddingModel {
+        let ndims = match model {
+            TEXT_EMBEDDING_3_LARGE => 3072,
+            TEXT_EMBEDDING_3_SMALL | TEXT_EMBEDDING_ADA_002 => 1536,
+            _ => 0,
+        };
+        EmbeddingModel::new(self.clone(), model, ndims)
+    }
+
+    fn embedding_model_with_ndims(&self, model: &str, ndims: usize) -> Self::EmbeddingModel {
+        EmbeddingModel::new(self.clone(), model, ndims)
+    }
+}
+
+impl<T> TranscriptionClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    type TranscriptionModel = TranscriptionModel<T>;
+    /// Create a transcription model with the given name.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::openai::{Client, self};
+    ///
+    /// // Initialize the OpenAI client
+    /// let openai = Client::new("your-open-ai-api-key");
+    ///
+    /// let gpt4 = openai.transcription_model(openai::WHISPER_1);
+    /// ```
+    fn transcription_model(&self, model: &str) -> Self::TranscriptionModel {
+        TranscriptionModel::new(self.clone(), model)
+    }
+}
+
+#[cfg(feature = "image")]
+impl<T> ImageGenerationClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Default + Send + 'static,
+{
+    type ImageGenerationModel = ImageGenerationModel<T>;
+    /// Create an image generation model with the given name.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::openai::{Client, self};
+    ///
+    /// // Initialize the OpenAI client
+    /// let openai = Client::new("your-open-ai-api-key");
+    ///
+    /// let gpt4 = openai.image_generation_model(openai::DALL_E_3);
+    /// ```
+    fn image_generation_model(&self, model: &str) -> Self::ImageGenerationModel {
+        ImageGenerationModel::new(self.clone(), model)
+    }
+}
+
+#[cfg(feature = "audio")]
+impl<T> AudioGenerationClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Send + Default + 'static,
+{
+    type AudioGenerationModel = AudioGenerationModel<T>;
+    /// Create an audio generation model with the given name.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::openai::{Client, self};
+    ///
+    /// // Initialize the OpenAI client
+    /// let openai = Client::new("your-open-ai-api-key");
+    ///
+    /// let gpt4 = openai.audio_generation_model(openai::TTS_1);
+    /// ```
+    fn audio_generation_model(&self, model: &str) -> Self::AudioGenerationModel {
+        AudioGenerationModel::new(self.clone(), model)
+    }
+}
+
+impl<T> VerifyClient for Client<T>
+where
+    T: HttpClientExt + Clone + std::fmt::Debug + Send + Default + 'static,
+{
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn verify(&self) -> Result<(), VerifyError> {
+        let req = self
+            .get("/models")?
+            .body(http_client::NoBody)
+            .map_err(|e| VerifyError::HttpError(e.into()))?;
+
+        let response = self.send(req).await?;
+
+        match response.status() {
+            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => Err(VerifyError::InvalidAuthentication),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR => {
+                let text = http_client::text(response).await?;
+                Err(VerifyError::ProviderError(text))
+            }
+            _ => {
+                //response.error_for_status()?;
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<H> Client<H>
